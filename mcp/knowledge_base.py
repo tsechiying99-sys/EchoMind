@@ -2,7 +2,7 @@
 RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 
 功能：
-  1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
+  1. 文档导入：将文本切片后存入 ChromaDB
   2. 语义检索：根据 query 从知识库中检索最相关的文档片段
   3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
 
@@ -11,25 +11,68 @@ ChromaDB 在这里的角色：
   - 这里用于存储知识库文档（RAG 检索）
   两者是不同的 collection，互不干扰。
 """
+import asyncio
 import hashlib
 import logging
+import os
 from typing import Any, Dict, List, Optional
+from sentence_transformers import SentenceTransformer
 
 import chromadb
 
+import re
+import threading
+
+import jieba
+from rank_bm25 import BM25Okapi
+
 logger = logging.getLogger(__name__)
 
+class BGEEncoder:
+    QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+    def __init__(self)-> None:
+        self.model = SentenceTransformer(
+            "BAAI/bge-small-zh-v1.5",
+            device="cpu",
+        )
+
+    def encode_documents(self, texts:list[str]) -> list[list[float]]:
+        vectors = self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def encode_query(self, query: str) -> list[float]:
+        text = self.QUERY_INSTRUCTION + query
+
+        vectors = self.model.encode(
+            [text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )[0]
+
+        return vectors.tolist()
 
 class KnowledgeBase:
     """
     基于 ChromaDB 的 RAG 知识库。
-
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
     调用 add() 时自动生成向量，query() 时自动做语义匹配。
     不需要额外调用 Anthropic Embeddings API。
     """
 
-    COLLECTION_NAME = "knowledge_base"
+    COLLECTION_NAME = "learning_knowledge_base_bge_v1"
+
+    BM25_STOP_WORDS = {
+        "的", "了", "是", "在", "和", "与", "或",
+        "为什么", "怎么", "如何", "什么", "哪些",
+        "使用", "进行", "实现", "内容", "资料", "课程",
+        "相关", "介绍", "说明",
+    }
 
     def __init__(
         self,
@@ -37,8 +80,11 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        # 优先连接独立 ChromaDB 服务
         self._use_server = False
+        # 使用BAAI/bge-small-zh-v1.5模型
+        self._encoder = BGEEncoder()
+
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             self._client = chromadb.HttpClient(
@@ -56,16 +102,126 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
         self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库"},
+            name="learning_knowledge_base_bge_v1",
+            metadata={
+                "description": "ProgMind 中文课程知识库",
+                "embedding_model": "BAAI/bge-small-zh-v1.5",
+                "hnsw:space": "cosine",
+            },
         )
 
-        # 如果知识库为空，导入默认文档
+        # 取得已有 Collection 后检查
+        metadata = self._collection.metadata or {}
+        if metadata.get("embedding_model") != "BAAI/bge-small-zh-v1.5":
+            raise RuntimeError("Collection 的 Embedding 模型不匹配")
+        if metadata.get("hnsw:space") != "cosine":
+            raise RuntimeError("Collection 距离类型不是 cosine")
+
+        # 如果知识库为空，提示导入文档
         if self._collection.count() == 0:
-            self._load_default_docs()
+            logger.info("课程知识库为空，请通过 /knowledge 接口导入课程资料")
+
+        self._bm25_lock = threading.RLock()
+        self._bm25: BM25Okapi | None = None
+        self._bm25_records: list[dict[str, Any]] = []
+
+        self._rebuild_bm25_index()
+
+        if metadata.get("hnsw:space") != "cosine":
+            raise RuntimeError("Collection 距离类型不是 cosine")
+
+    @classmethod
+    def _tokenize(cls, text: str) -> list[str]:
+        """用于中文和代码标识符分词"""
+        #统一小写
+        normalized = (text or "").strip().lower()
+
+        if not normalized:
+            return []
+
+        #进行中文分词
+        candidates = list(
+            jieba.lcut(normalized, cut_all=False)
+        )
+        #额外提取英文、代码标识符和数字
+        candidates.extend(
+            re.findall(
+                r"\*{0,2}[a-zA-Z_][a-zA-Z0-9_]*|\d+(?:\.\d+)?",
+                normalized,
+            )
+        )
+
+        tokens: list[str] = []
+
+        for token in candidates:
+            token = token.strip()
+            if not token:
+                continue
+            # 删除标点符号以及单独的下划线
+            if not re.search(
+                    r"[\u4e00-\u9fffA-Za-z0-9]",
+                    token,
+            ):
+                continue
+            # 删除停用词
+            if token in cls.BM25_STOP_WORDS:
+                continue
+            # 去重
+            if token not in tokens:
+                tokens.append(token)
+
+        return tokens
+
+    def _rebuild_bm25_index(self) -> None:
+        """从 ChromaDB 已有文档重建内存 BM25 索引。"""
+        snapshot = self._collection.get(
+            include=["documents", "metadatas"],
+        )
+
+        ids = snapshot.get("ids") or []
+        documents = snapshot.get("documents") or []
+        metadatas = snapshot.get("metadatas") or []
+
+        records: list[dict[str, Any]] = []
+        corpus: list[list[str]] = []
+
+        for doc_id, document, metadata in zip(
+                ids,
+                documents,
+                metadatas,
+        ):
+            content = str(document or "").strip()
+
+            if not content:
+                continue
+
+            tokens = self._tokenize(content)
+
+            if not tokens:
+                continue
+
+            metadata = metadata or {}
+
+            records.append({
+                "id": doc_id,
+                "title": metadata.get("title", ""),
+                "content": content,
+                "chunk": metadata.get("chunk_index", 0),
+                "_token_set": frozenset(tokens),
+            })
+            corpus.append(tokens)
+
+        bm25 = BM25Okapi(corpus) if corpus else None
+
+        with self._bm25_lock:
+            self._bm25 = bm25
+            self._bm25_records = records
+
+        logger.info(
+            "BM25 索引已重建: %d 个文档片段",
+            len(records),
+        )
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -84,64 +240,357 @@ class KnowledgeBase:
             chunks  = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                doc_id = hashlib.md5(
+                    f"{title}_{i}_{chunk}".encode("utf-8")
+                ).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
                 metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
 
         if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
-            logger.info(f"知识库导入 {len(ids)} 个文档片段")
+            embeddings = self._encoder.encode_documents(docs)
+            self._collection.upsert(ids=ids, documents=docs, metadatas=metas ,embeddings=embeddings)
+            self._rebuild_bm25_index()
+            logger.info("知识库导入 %d 个文档片段，BM25 索引已刷新",len(ids),)
 
         return len(ids)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        语义检索：根据 query 返回最相关的文档片段。
+    def _dense_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        query = (query or "").strip()
+        if not query or top_k <= 0:
+            return []
 
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
-        """
+        document_count = self._collection.count()
+        if document_count <= 0:
+            return []
+        try:
+            min_score = float(
+                os.getenv("KNOWLEDGE_MIN_SIMILARITY", "0.25")
+            )
+        except ValueError:
+            min_score = 0.25
+
+        # 多召回一些，过滤后最多返回 top_k。
+        recall_k = min(max(top_k * 3, top_k), document_count)
+
+        # 将问题向量化
+        query_embedding = self._encoder.encode_query(query)
+
         results = self._collection.query(
-            query_texts=[query],
-            n_results=top_k,
+            query_embeddings=[query_embedding],
+            n_results=recall_k,
+            include=["documents", "metadatas", "distances"],
         )
 
         items = []
         if results["documents"] and results["documents"][0]:
-            for doc, meta, dist in zip(
+            result_ids = (results["ids"][0] if results.get("ids") else [])
+            for doc_id, doc, meta, dist in zip(
+                result_ids,
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
+                score = round(1.0 - float(dist), 4)
+                if score < min_score:
+                    continue
                 items.append({
+                    "id": doc_id,
                     "title":    meta.get("title", ""),
                     "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
+                    "score":    score,
+                    "dense_score": score,
+                    "bm25_score": 0.0,
                     "chunk":    meta.get("chunk_index", 0),
+                    "match_sources": ["dense"],
                 })
+                if len(items) >= top_k:
+                    break
 
         return items
+
+    def _bm25_search(
+            self,
+            query: str,
+            top_k: int,
+    ) -> list[dict[str, Any]]:
+        query_tokens = self._tokenize(query)
+
+        if not query_tokens:
+            return []
+
+        try:
+            min_score = float(
+                os.getenv("BM25_MIN_SCORE", "0.5")
+            )
+        except ValueError:
+            min_score = 0.5
+
+        try:
+            min_idf = float(
+                os.getenv("BM25_MIN_IDF", "1.0")
+            )
+        except ValueError:
+            min_idf = 1.0
+
+        with self._bm25_lock:
+            bm25 = self._bm25
+            records = list(self._bm25_records)
+
+        if bm25 is None or not records:
+            return []
+
+        scores = bm25.get_scores(query_tokens)
+
+        # BM25 可以独立补回向量检索容易漏掉的代码标识符，例如
+        # UnboundLocalError、nonlocal、row_number、*args。普通自然语言词项
+        # 仍需 Dense 召回提供语义佐证，避免“保存、调用”等词造成假阳性。
+        exact_identifiers = {
+            token.lower()
+            for token in re.findall(
+                r"\*{1,2}[A-Za-z_][A-Za-z0-9_]*"
+                r"|[A-Za-z_][A-Za-z0-9_]*",
+                query,
+            )
+        }
+
+        ranked_indexes = sorted(
+            range(len(scores)),
+            key=lambda index: float(scores[index]),
+            reverse=True,
+        )
+
+        results: list[dict[str, Any]] = []
+
+        for index in ranked_indexes:
+            raw_score = float(scores[index])
+
+            # 没有可靠关键词重合的结果不进入融合
+            if raw_score < min_score:
+                continue
+
+            record = records[index]
+
+            query_token_set = set(query_tokens)
+            document_token_set = set(
+                record.get("_token_set", ())
+            )
+
+            matched_tokens = (
+                    query_token_set & document_token_set
+            )
+
+            if not matched_tokens:
+                continue
+
+            # 至少有一个高区分度词项真正出现在文档中
+            max_matched_idf = max(
+                float(bm25.idf.get(token, 0.0))
+                for token in matched_tokens
+            )
+
+            if max_matched_idf < min_idf:
+                continue
+
+            matched_identifiers = matched_tokens & exact_identifiers
+
+            public_record = {
+                key: value
+                for key, value in record.items()
+                if key != "_token_set"
+            }
+
+            results.append({
+                **public_record,
+                "score": raw_score,
+                "dense_score": 0.0,
+                "bm25_score": round(raw_score, 4),
+                "bm25_max_idf": round(max_matched_idf, 4),
+                "matched_terms": sorted(matched_tokens),
+                "matched_identifiers": sorted(matched_identifiers),
+                "exact_identifier_match": bool(matched_identifiers),
+                "match_sources": ["bm25"],
+            })
+
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    def search(
+            self,
+            query: str,
+            top_k: int = 5,
+            retrieval_mode: str = "hybrid",
+    ) -> list[dict[str, Any]]:
+        query = (query or "").strip()
+
+        if not query or top_k <= 0:
+            return []
+
+        recall_k = max(top_k * 3, 10)
+
+        dense_results = self._dense_search(
+            query,
+            recall_k,
+        )
+
+        if retrieval_mode == "dense":
+            return dense_results[:top_k]
+
+        bm25_results = self._bm25_search(
+            query,
+            recall_k,
+        )
+
+        rrf_k = 60
+        dense_weight = float(
+            os.getenv("HYBRID_DENSE_WEIGHT", "0.7")
+        )
+        bm25_weight = float(
+            os.getenv("HYBRID_BM25_WEIGHT", "0.3")
+        )
+
+        merged: dict[str, dict[str, Any]] = {}
+
+        def add_result(
+                item: dict[str, Any],
+                rank: int,
+                source: str,
+                weight: float,
+        ) -> None:
+            doc_id = str(item.get("id", ""))
+
+            if not doc_id:
+                doc_id = hashlib.md5(
+                    (
+                        str(item.get("title", "")) + str(item.get("chunk", 0)) + str(item.get("content", ""))
+                    ).encode("utf-8")
+                ).hexdigest()
+
+            existing = merged.setdefault(
+                doc_id,
+                {
+                    **item,
+                    "rrf_raw": 0.0,
+                    "dense_score": 0.0,
+                    "bm25_score": 0.0,
+                    "match_sources": [],
+                },
+            )
+
+            existing["rrf_raw"] += weight / (rrf_k + rank)
+
+            if source == "dense":
+                existing["dense_score"] = float(
+                    item.get("dense_score", item.get("score", 0.0))
+                )
+            else:
+                existing["bm25_score"] = float(
+                    item.get("bm25_score", item.get("score", 0.0))
+                )
+                existing["exact_identifier_match"] = bool(
+                    existing.get("exact_identifier_match", False)
+                    or item.get("exact_identifier_match", False)
+                )
+
+                matched_identifiers = set(
+                    existing.get("matched_identifiers", [])
+                )
+                matched_identifiers.update(
+                    item.get("matched_identifiers", [])
+                )
+                existing["matched_identifiers"] = sorted(
+                    matched_identifiers
+                )
+
+            if source not in existing["match_sources"]:
+                existing["match_sources"].append(source)
+
+        for rank, item in enumerate(dense_results, start=1):
+            add_result(
+                item,
+                rank,
+                "dense",
+                dense_weight,
+            )
+
+        for rank, item in enumerate(bm25_results, start=1):
+            add_result(
+                item,
+                rank,
+                "bm25",
+                bm25_weight,
+            )
+
+        max_rrf = (
+                          dense_weight + bm25_weight
+                  ) / (rrf_k + 1)
+
+        results = []
+
+        for item in merged.values():
+            sources = set(item.get("match_sources", []))
+
+            # BM25 单路结果只允许精确代码标识符命中。普通自然语言词项
+            # 必须同时通过 Dense 的语义阈值，防止宽泛词带入无关片段。
+            if (
+                sources == {"bm25"}
+                and not item.get("exact_identifier_match", False)
+            ):
+                continue
+
+            fusion_score = (
+                item.pop("rrf_raw") / max_rrf
+                if max_rrf > 0
+                else 0.0
+            )
+
+            item["score"] = round(fusion_score, 4)
+            item["fusion_score"] = round(fusion_score, 4)
+            item["dense_score"] = round(
+                float(item["dense_score"]),
+                4,
+            )
+            item["bm25_score"] = round(
+                float(item["bm25_score"]),
+                4,
+            )
+
+            results.append(item)
+
+        results.sort(
+            key=lambda item: float(
+                item.get("fusion_score", 0.0)
+            ),
+            reverse=True,
+        )
+
+        return results[:top_k]
 
     @property
     def doc_count(self) -> int:
         return self._collection.count()
 
     # ── MCP 工具 handler ─────────────────────────────────────────────────────
-
-    async def search_handler(self, params: Dict[str, Any], context: Any) -> List[Dict]:
-        """
-        作为 MCP 工具的 handler 注册。
-
-        MCPToolManager.register(Tool(
-            name="knowledge_search",
-            handler=kb.search_handler,
-            ...
-        ))
-        """
+    async def search_handler(
+            self,
+            params: Dict[str, Any],
+            context: Any,
+    ) -> List[Dict]:
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return self.search(query, top_k=top_k)
+        retrieval_mode = params.get(
+            "retrieval_mode",
+            "hybrid",
+        )
+
+        return await asyncio.to_thread(
+            self.search,
+            query,
+            top_k,
+            retrieval_mode,
+        )
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
@@ -158,6 +607,18 @@ class KnowledgeBase:
             sent = sent.strip()
             if not sent:
                 continue
+            if len(sent) > chunk_size:
+                if current:
+                    chunks.append(current)
+                    current = ""
+
+                for start in range(0, len(sent), chunk_size):
+                    piece = sent[start:start + chunk_size]
+                    if len(piece) == chunk_size:
+                        chunks.append(piece)
+                    else:
+                        current = piece
+                continue
             if len(current) + len(sent) + 1 > chunk_size:
                 if current:
                     chunks.append(current)
@@ -169,79 +630,3 @@ class KnowledgeBase:
             chunks.append(current)
 
         return chunks
-
-    def _load_default_docs(self) -> None:
-        """导入默认知识库文档（客服场景常见问题）。"""
-        default_docs = [
-            {
-                "title": "退款政策",
-                "content": (
-                    "退款政策说明。"
-                    "用户在购买后 7 天内可以申请无理由退款。"
-                    "退款申请提交后，系统会在 1-3 个工作日内审核。"
-                    "审核通过后，款项将在 5-7 个工作日内退回原支付账户。"
-                    "如果商品已发货，需要先完成退货流程才能退款。"
-                    "退货运费由用户承担，除非是商品质量问题。"
-                    "超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能退款。"
-                ),
-            },
-            {
-                "title": "订单查询",
-                "content": (
-                    "订单查询指南。"
-                    "用户可以通过订单号查询订单状态。"
-                    "订单状态包括：待支付、已支付、已发货、运输中、已签收、已完成。"
-                    "如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。"
-                    "物流信息通常在发货后 24 小时内更新。"
-                    "如果订单显示异常，请提供订单号联系客服处理。"
-                ),
-            },
-            {
-                "title": "账户安全",
-                "content": (
-                    "账户安全说明。"
-                    "建议用户定期修改密码，密码长度至少 8 位，包含字母和数字。"
-                    "如果忘记密码，可以通过绑定的手机号或邮箱重置。"
-                    "发现账户异常登录时，系统会自动锁定账户并发送通知。"
-                    "用户可以在安全设置中开启两步验证，提高账户安全性。"
-                    "不要将密码分享给他人，客服人员不会索要用户密码。"
-                ),
-            },
-            {
-                "title": "技术故障排查",
-                "content": (
-                    "常见技术问题排查。"
-                    "应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。"
-                    "登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。"
-                    "页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。"
-                    "支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。"
-                    "500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。"
-                ),
-            },
-            {
-                "title": "会员与积分",
-                "content": (
-                    "会员积分规则。"
-                    "每消费 1 元累积 1 积分。"
-                    "积分可以在下次购物时抵扣，100 积分 = 1 元。"
-                    "会员等级分为：普通会员、银卡会员（累计消费 1000 元）、金卡会员（累计消费 5000 元）。"
-                    "银卡会员享受 95 折优惠，金卡会员享受 9 折优惠。"
-                    "积分有效期为 1 年，过期自动清零。"
-                    "生日当月消费可获得双倍积分。"
-                ),
-            },
-            {
-                "title": "配送说明",
-                "content": (
-                    "配送服务说明。"
-                    "标准配送：3-5 个工作日送达，免运费（订单满 99 元）。"
-                    "加急配送：1-2 个工作日送达，运费 15 元。"
-                    "同城配送：当日达或次日达，运费 10 元。"
-                    "偏远地区可能需要额外 2-3 天。"
-                    "配送时间为每天 9:00-18:00，节假日可能延迟。"
-                    "如果需要修改收货地址，请在发货前联系客服。"
-                ),
-            },
-        ]
-        self.add_documents(default_docs)
-        logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")

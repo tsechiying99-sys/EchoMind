@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content,extract_json_value
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +31,14 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class CircuitState(Enum):
-    CLOSED    = "closed"     # 正常
-    OPEN      = "open"       # 熔断，拒绝请求
+    CLOSED    = "closed"     # 正常使用（熔断关闭）
+    OPEN      = "open"       # 熔断开启，拒绝请求
     HALF_OPEN = "half_open"  # 探测恢复
 
 
 @dataclass
 class ToolResult:
+    """工具调用后的结果"""
     success:        bool
     data:           Any
     tool_name:      str
@@ -58,10 +59,12 @@ class ToolStats:
 
     @property
     def success_rate(self) -> float:
+        """成功率"""
         return self.success / self.total if self.total else 1.0
 
     @property
     def avg_latency_ms(self) -> float:
+        """平均耗时"""
         return self.total_latency_ms / self.total if self.total else 0.0
 
 
@@ -81,9 +84,13 @@ class CircuitBreaker:
         self.recovery_s  = recovery_s
         self.state       = CircuitState.CLOSED
         self.fail_count  = 0
-        self.opened_at:  Optional[float] = None
+        self.opened_at:  Optional[float] = None #开启的时间
 
     def allow(self) -> bool:
+        """
+        在调用工具前判断是否允许真实请求通过。
+        熔断器为closed状态说明可以使用工具，open状态不可以使用工具，但如果监管时间-开启时间>=恢复时间进行探测
+        """
         if self.state == CircuitState.CLOSED:
             return True
         if self.state == CircuitState.OPEN:
@@ -270,24 +277,68 @@ class MCPToolManager:
           原始: "退款流程"
           改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
         """
-        prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：每个子查询角度不同，覆盖原始问题的不同方面。
-原始查询: "{query}"
-返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
-        prompt = self._clean_text(prompt)
-        try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            queries = json.loads(raw[s:e])
-            # 原始查询也保留，去重
-            return list(dict.fromkeys([query] + queries))
-        except Exception as ex:
-            logger.warning(f"查询改写失败，使用原始查询: {ex}")
-            return [query]
+        query = self._clean_text(query).strip()
+        if not query:
+            return []
+        prompt = self._clean_text(f"""
+        请将用户查询改写为最多 {n} 个适合知识库检索的中文子查询。
+
+        要求：
+        1. 保留原始查询中的人名、术语、数字和专有名词。
+        2. 不要添加原查询不存在的事实。
+        3. 每个查询必须是非空字符串。
+        4. 只返回合法 JSON 数组，不要解释，不要 Markdown 代码块。
+
+        用户查询：{json.dumps(query, ensure_ascii=False)}
+
+        返回格式：
+        ["子查询1", "子查询2", "子查询3"]
+        """)
+
+        last_error: Optional[Exception] = None
+
+        # 第一次可能因为模型输出为空或格式错误失败，因此允许重试一次。
+        for attempt in range(2):
+            try:
+                resp = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=1024,
+                    temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+
+                raw = extract_text_content(resp.content).strip()
+                queries = extract_json_value(raw, expected_type=list)
+
+                cleaned_queries: List[str] = []
+                for item in queries:
+                    if not isinstance(item, str):
+                        continue
+                    rewritten = self._clean_text(item).strip()
+                    if not rewritten or len(rewritten) > 200:
+                        continue
+                    cleaned_queries.append(rewritten)
+
+                # 始终保留原始查询，并保持顺序去重。
+                result = list(dict.fromkeys([query, *cleaned_queries]))
+                if result:
+                    return result[: n + 1]
+
+                raise ValueError("查询改写结果中没有有效字符串")
+            except Exception as ex:
+                last_error = ex
+                logger.warning(
+                    "查询改写第 %d 次失败: query=%r error=%s",
+                    attempt + 1,
+                    query,
+                    ex,
+                )
+        logger.warning(
+            "查询改写最终失败，使用原始查询: query=%r error=%s",
+            query,
+            last_error,
+        )
+        return [query]
 
     async def search_with_rewrite(
         self,
@@ -307,21 +358,81 @@ class MCPToolManager:
 
         # 2. 并行召回：所有子查询同时检索
         recall_k = max(top_k, 5)
+        # 强制保证原始问题位于第一项
+        ordered_queries = [query]
+
+        for rewritten_query in sub_queries:
+            if rewritten_query not in ordered_queries:
+                ordered_queries.append(rewritten_query)
+
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
-            for q in sub_queries
+            self.call(
+                tool_name,
+                {
+                    "query": current_query,
+                    "top_k": recall_k,
+                    # 原问题使用 BM25+BGE，改写问题只使用 BGE
+                    "retrieval_mode": (
+                        "hybrid"
+                        if index == 0
+                        else "dense"
+                    ),
+                },
+                context,
+                use_cache=True,
+            )
+            for index, current_query in enumerate(
+                ordered_queries
+            )
         ]
+        #一个子查询异常不会取消其他子查询。
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
-        seen, merged = set(), []
-        for r in results:
-            if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+        # 3. 合并去重（）
+        # 按文档身份去重，不把 score 放入去重键
+        merged_by_key: Dict[tuple, Dict[str, Any]] = {}
+
+        for result in results:
+            if not (
+                    isinstance(result, ToolResult)
+                    and result.success
+                    and isinstance(result.data, list)
+            ):
+                continue
+
+            for item in result.data:
+                if not isinstance(item, dict):
+                    continue
+
+                title = str(item.get("title", "")).strip()
+                content = str(item.get("content", "")).strip()
+                chunk = item.get("chunk", 0)
+
+                if not content:
+                    continue
+
+                document_key = (
+                    title,
+                    content,
+                    chunk,
+                )
+
+                existing = merged_by_key.get(document_key)
+
+                # 同一文档被多个子查询召回时，只保留最高分版本
+                if existing is None:
+                    merged_by_key[document_key] = item
+                    continue
+
+                current_score = float(item.get("score", 0.0))
+                existing_score = float(
+                    existing.get("score", 0.0)
+                )
+
+                if current_score > existing_score:
+                    merged_by_key[document_key] = item
+
+        merged = list(merged_by_key.values())
 
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
@@ -332,49 +443,42 @@ class MCPToolManager:
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
-    async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+    async def _rerank(
+            self,
+            query: str,
+            items: List[Any],
+            top_k: int,
+    ) -> List[Any]:
         """
-        用 LLM 对召回结果重新打分排序。
-
-        解决问题：向量检索的相似度分数不等于"对用户有用"，
-        LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
+        对候选结果进行相关性评分。
         """
-        if len(items) <= top_k:
-            return items
+        valid_items = [
+            item
+            for item in items
+            if isinstance(item, dict)
+               and float(item.get("score", 0.0)) > 0.0
+        ]
 
-        # 将结果序列化为文本供 LLM 评分
-        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-                               for i, item in enumerate(items))
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
-用户查询: "{query}"
-检索结果:
-{items_text}
-
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
-        prompt = self._clean_text(prompt)
-
-        try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
-        except Exception as ex:
-            logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+        return sorted(
+            valid_items,
+            key=lambda item: float(
+                item.get(
+                    "fusion_score",
+                    item.get("score", 0.0),
+                )
+            ),
+            reverse=True,
+        )[:top_k]
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
     def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0) -> str:
+        """生成缓存key:不同插入顺序的同内容字典生成相同缓存 Key"""
         payload = {"params": params, "rerank_top_k": rerank_top_k}
         return f"{name}:{hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
 
     def _get_cache(self, name: str, params: Dict, rerank_top_k: int = 0) -> Optional[Tuple[Any, bool]]:
+        """获取缓存，如果没有到期返回内容和重排等级；如果到期删除缓存"""
         key = self._cache_key(name, params, rerank_top_k)
         if key in self._cache:
             data, expire_at, reranked = self._cache[key]
@@ -392,6 +496,7 @@ class MCPToolManager:
         rerank_top_k: int = 0,
         reranked: bool = False,
     ) -> None:
+        """设置缓存（用一个字典来实现）"""
         if len(self._cache) >= 5000:
             # 清掉最旧的 1/4
             for k in list(self._cache)[:1250]:
@@ -443,3 +548,18 @@ class MCPToolManager:
             }
             for name, t in self._tools.items()
         }
+
+    # ── 对缓存进行清理 ──────────────────────────────────────────────────────────────────
+    def clear_cache(
+            self,
+            tool_name: str | None = None,
+    ) -> None:
+        if tool_name is None:
+            self._cache.clear()
+            return
+
+        prefix = f"{tool_name}:"
+
+        for key in list(self._cache):
+            if key.startswith(prefix):
+                del self._cache[key]

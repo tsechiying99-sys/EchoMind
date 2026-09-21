@@ -17,11 +17,12 @@
 """
 import asyncio
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
@@ -34,11 +35,9 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
-    GENERAL   = "general"    # 通用客服
-    TECHNICAL = "technical"  # 技术支持
-    BILLING   = "billing"    # 账单/退款
-    ESCALATION = "escalation" # 人工升级（占位）
-
+    EXPLAIN   = "explain"    # 讲解Agent
+    QA = "qa"  # 答疑Agent
+    QUIZ   = "quiz"    # 出题Agent
 
 @dataclass
 class AgentStats:
@@ -91,6 +90,7 @@ class OrchestratorResult:
     response:    str
     agent_type:  AgentType
     intent:      Optional[IntentCategory]
+    success: bool = True
     escalated:   bool  = False
     latency_ms:  float = 0.0
 
@@ -110,33 +110,52 @@ class BaseAgent:
         self.stats   = AgentStats()
 
     async def handle(self, req: Request) -> AgentResponse:
-        t0 = time.monotonic()
-        self.stats.total += 1
+        start_time = time.monotonic()
+        succeeded = False
+        content = ""
         try:
             content = await self._call_llm(req)
-            ms = (time.monotonic() - t0) * 1000
-            self.stats.success += 1
-            self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
-            return AgentResponse(
-                agent_type=self.agent_type,
-                content=content,
-                success=True,
-                latency_ms=ms,
-                escalate=escalate,
-            )
+            succeeded = True
         except Exception as ex:
-            ms = (time.monotonic() - t0) * 1000
+            logger.exception("%s 处理失败", self.agent_type.value)
+            content = "抱歉，处理您的请求时出现问题，请稍后重试。"
+        finally:
+            ms = (time.monotonic() - start_time) * 1000
+            self.stats.total += 1
             self.stats.total_ms += ms
-            logger.error(f"{self.agent_type.value} 处理失败: {ex}")
-            return AgentResponse(
-                agent_type=self.agent_type,
-                content="抱歉，处理您的请求时出现问题，请稍后重试。",
-                success=False,
-                latency_ms=ms,
+            if succeeded:
+                self.stats.success += 1
+            escalate = self._needs_escalation(content)
+        return AgentResponse(
+            agent_type=self.agent_type,
+            content=content,
+            success=succeeded,
+            latency_ms=ms,
+            escalate=escalate,
             )
 
     async def _call_llm(self, req: Request) -> str:
+        resp = await self._client.messages.create(**self._llm_request(req))
+        content = extract_text_content(resp.content).strip()
+
+        #进一步对content进行检验
+        if not content:
+            block_types = [
+                getattr(block, "type", type(block).__name__)
+                for block in (resp.content or [])
+            ]
+
+            logger.error(
+                "LLM 返回空回答: stop_reason=%s, blocks=%s",
+                getattr(resp, "stop_reason", None),
+                block_types,
+            )
+            raise RuntimeError("LLM 返回了空回答")
+
+        return content
+
+    def _llm_request(self, req: Request) -> Dict[str, Any]:
+        """统一构建普通调用和流式调用使用的模型参数。"""
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -146,13 +165,34 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=self._build_system_prompt(req),
-            messages=messages,
-        )
-        return extract_text_content(resp.content)
+        return {
+            "model": self._model,
+            "max_tokens": int(os.getenv("AGENT_MAX_TOKENS", "4096")),
+            "system": self._build_system_prompt(req),
+            "messages": messages,
+        }
+
+    async def stream(self, req: Request) -> AsyncIterator[str]:
+        """直接转发模型文本增量，并与普通调用共用 Agent 统计口径。"""
+        start_time = time.monotonic()
+        succeeded = False
+        chunks: List[str] = []
+        try:
+            async with self._client.messages.stream(**self._llm_request(req)) as response_stream:
+                async for text in response_stream.text_stream:
+                    if text:
+                        chunks.append(text)
+                        yield text
+
+            if not "".join(chunks).strip():
+                raise RuntimeError("LLM 返回了空回答")
+            succeeded = True
+        finally:
+            ms = (time.monotonic() - start_time) * 1000
+            self.stats.total += 1
+            self.stats.total_ms += ms
+            if succeeded:
+                self.stats.success += 1
 
     def _build_system_prompt(self, req: Request) -> str:
         """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
@@ -164,32 +204,47 @@ class BaseAgent:
         return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
 
     def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
-        return any(kw in content for kw in keywords)
+        """检测回答是否建议教师介入。"""
+        keywords = [
+            "建议咨询老师",
+            "需要教师确认",
+            "请老师进一步指导",
+            "需要人工辅导",
+        ]
+        return any(keyword in content for keyword in keywords)
 
 
-class GeneralAgent(BaseAgent):
-    agent_type    = AgentType.GENERAL
+class ExplainAgent(BaseAgent):
+    agent_type    = AgentType.EXPLAIN
     system_prompt = (
-        "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
-        "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        "你是学习讲解 Agent。"
+        "根据学生当前学习进度和薄弱点讲解知识。"
+        "优先依据提供的课程资料，不要编造课程内容。"
+        "先解释核心概念，再给一个简单示例，最后用一个小问题检查理解。"
+        "控制一次回复的新知识数量，避免使用学生尚未学习的高级概念。"
     )
 
 
-class TechnicalAgent(BaseAgent):
-    agent_type    = AgentType.TECHNICAL
+class QaAgent(BaseAgent):
+    agent_type    = AgentType.QA
     system_prompt = (
-        "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
-        "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
+        "你是学习答疑 Agent。"
+        "先判断学生具体卡在哪一步，再进行针对性解释。"
+        "如果学生正在完成练习，优先给提示、思路和检查方向，"
+        "不要立即给出完整答案。"
+        "如果信息不足，先提出一个最关键的澄清问题。"
+        "优先依据课程资料回答，并明确区分资料内容和补充解释。"
     )
 
 
-class BillingAgent(BaseAgent):
-    agent_type    = AgentType.BILLING
+class QuizAgent(BaseAgent):
+    agent_type    = AgentType.QUIZ
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你是练习出题 Agent。"
+        "根据学生已学内容和薄弱点生成一道难度适中的题目。"
+        "题目必须注明考查知识点和难度。"
+        "默认只输出题目，不同时泄露答案。"
+        "只有学生提交答案或明确要求答案后，才进行评分和讲解。"
     )
 
 
@@ -207,10 +262,11 @@ class AgentOrchestrator:
 
     # 意图 → Agent 类型的静态映射（路由表）
     _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
-        IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
-        IntentCategory.BILLING:    AgentType.BILLING,
-        IntentCategory.ACCOUNT:    AgentType.BILLING,
-        IntentCategory.ESCALATION: AgentType.ESCALATION,
+        IntentCategory.EXPLAIN:  AgentType.EXPLAIN,
+        IntentCategory.QA:    AgentType.QA,
+        IntentCategory.QUIZ:    AgentType.QUIZ,
+        IntentCategory.REVIEW: AgentType.EXPLAIN,
+        IntentCategory.GREETING: AgentType.EXPLAIN
         # 其余意图 → GENERAL（默认）
     }
 
@@ -231,9 +287,9 @@ class AgentOrchestrator:
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model, skill_manager)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model, skill_manager)],
-            AgentType.BILLING:   [BillingAgent(client, model, skill_manager)],
+            AgentType.EXPLAIN:   [ExplainAgent(client, model, skill_manager)],
+            AgentType.QA: [QaAgent(client, model, skill_manager)],
+            AgentType.QUIZ:   [QuizAgent(client, model, skill_manager)],
         }
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
@@ -270,10 +326,9 @@ class AgentOrchestrator:
         response = await self._execute(req, agent_type)
 
         # 4. 升级检查
-        escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
-            escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+        escalated = response.escalate or req.urgency == UrgencyLevel.CRITICAL
+        if escalated:
+            logger.warning("学习请求 %s 建议人工关注: urgency=%s",req.request_id,req.urgency,)
             # 生产环境：此处创建工单、通知人工客服
 
         return OrchestratorResult(
@@ -281,6 +336,8 @@ class AgentOrchestrator:
             response=response.content,
             agent_type=response.agent_type,
             intent=req.intent,
+            # 用于判断该编排结果是否成功
+            success=response.success,
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
         )
@@ -295,10 +352,16 @@ class AgentOrchestrator:
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 合并：拼接所有成功响应
-        parts = []
-        for r in responses:
-            if isinstance(r, AgentResponse) and r.success:
-                parts.append(f"[{r.agent_type.value}]\n{r.content}")
+        successful_responses = [
+            response
+            for response in responses
+            if isinstance(response, AgentResponse) and response.success
+        ]
+
+        parts = [
+            f"[{response.agent_type.value}]\n{response.content}"
+            for response in successful_responses
+        ]
 
         combined = "\n\n".join(parts) if parts else "抱歉，所有 Agent 均处理失败。"
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
@@ -308,21 +371,97 @@ class AgentOrchestrator:
             response=combined,
             agent_type=agent_types[0],
             intent=req.intent,
+            #用于判断该编排结果是否成功
+            success=bool(successful_responses),
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
         )
+
+    async def stream(self, req: Request) -> AsyncIterator[Dict[str, Any]]:
+        """
+        流式执行一次请求。
+
+        单 Agent 直接转发模型 token；复合意图继续使用原并行编排，完成后作为
+        一个 delta 返回，避免多个 Agent 的 token 相互穿插破坏可读性。
+        """
+        t0 = time.monotonic()
+        if req.intent is None:
+            intent_result = await self._intent_recognizer.recognize(
+                req.message, history=req.history
+            )
+            req.intent = intent_result.intent
+            req.urgency = intent_result.urgency
+
+        collaboration = self._collaboration_targets(req)
+        if len(collaboration) > 1:
+            yield {
+                "type": "meta",
+                "intent": req.intent.value if req.intent else "other",
+                "agent_type": collaboration[0].value,
+            }
+            result = await self.run_parallel(req, collaboration)
+            yield {"type": "delta", "text": result.response}
+            yield {"type": "done", "result": result}
+            return
+
+        requested_type = self._route(req.intent, req.urgency)
+        agent = self._best_agent(requested_type)
+        if agent is None:
+            agent = self._best_agent(AgentType.EXPLAIN)
+        if agent is None:
+            raise RuntimeError("学习服务暂时不可用，请稍后重试")
+
+        yield {
+            "type": "meta",
+            "intent": req.intent.value if req.intent else "other",
+            "agent_type": agent.agent_type.value,
+        }
+
+        chunks: List[str] = []
+        try:
+            async for text in agent.stream(req):
+                chunks.append(text)
+                yield {"type": "delta", "text": text}
+        except Exception:
+            # 尚未向客户端输出正文时，保留原来的专属 Agent 降级语义。
+            if chunks or requested_type == AgentType.EXPLAIN:
+                raise
+            logger.warning("%s 流式处理失败，降级到 ExplainAgent", requested_type.value)
+            fallback = self._best_agent(AgentType.EXPLAIN)
+            if fallback is None or fallback is agent:
+                raise
+            agent = fallback
+            async for text in agent.stream(req):
+                chunks.append(text)
+                yield {"type": "delta", "text": text}
+
+        content = "".join(chunks).strip()
+        if not content:
+            raise RuntimeError("LLM 返回了空回答")
+
+        escalated = (
+            agent._needs_escalation(content)
+            or req.urgency == UrgencyLevel.CRITICAL
+        )
+        result = OrchestratorResult(
+            request_id=req.request_id,
+            response=content,
+            agent_type=agent.agent_type,
+            intent=req.intent,
+            success=True,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - t0) * 1000,
+        )
+        yield {"type": "done", "result": result}
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
 
     def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
         """
-        三层路由决策：
-          1. 意图映射
-          2. 紧急度覆盖（CRITICAL 直接升级）
-          3. 默认 GENERAL
+        根据学习意图选择 Agent。
         """
         if urgency == UrgencyLevel.CRITICAL:
-            return AgentType.ESCALATION
+            return AgentType.EXPLAIN
 
         if intent and intent in self._INTENT_ROUTING:
             target = self._INTENT_ROUTING[intent]
@@ -330,25 +469,40 @@ class AgentOrchestrator:
             if target in self._pool and self._pool[target]:
                 return target
 
-        return AgentType.GENERAL
+        return AgentType.EXPLAIN
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:
         """
         判断是否需要多个 Agent 并行协作。
-
         意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
         """
         msg = req.message.lower()
         targets: List[AgentType] = []
 
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
+        explain_keywords = [
+            "解释", "讲一下", "什么是", "原理", "概念",
+        ]
+        qa_keywords = [
+            "为什么", "哪里错", "不理解", "怎么改", "报错",
+        ]
+        quiz_keywords = [
+            "出题", "练习", "考考我", "测验",
+        ]
 
-        if req.intent == IntentCategory.TECHNICAL or any(kw in msg for kw in technical_kws):
-            targets.append(AgentType.TECHNICAL)
-        if req.intent in (IntentCategory.BILLING, IntentCategory.ACCOUNT) or any(kw in msg for kw in billing_kws):
-            targets.append(AgentType.BILLING)
+        if (req.intent == IntentCategory.EXPLAIN or
+            any(keyword in msg for keyword in explain_keywords)
+        ):
+            targets.append(AgentType.EXPLAIN)
+
+        if (req.intent == IntentCategory.QA
+            or any(keyword in msg for keyword in qa_keywords)
+        ):
+            targets.append(AgentType.QA)
+
+        if (req.intent == IntentCategory.QUIZ
+            or any(keyword in msg for keyword in quiz_keywords)
+        ):
+            targets.append(AgentType.QUIZ)
 
         # 保持顺序去重，并只返回当前有实例的 Agent 类型。
         deduped = list(dict.fromkeys(targets))
@@ -358,30 +512,40 @@ class AgentOrchestrator:
         """
         性能路由：从同类 Agent 中选 routing_score() 最高的。
         这是"基于在线表现动态调整路由"的核心。
+
+        优先选择健康 Agent。
+        如果该类型只有一个实例，或者所有实例都被 Monitor 降权，
+        仍返回评分最高的实例；是否真正不可用应由实际执行结果决定。
         """
         agents = self._pool.get(agent_type, [])
         if not agents:
             return None
-        return max(agents, key=lambda a: a.stats.routing_score())
+        healthy = [
+            agent for agent in agents
+            if agent.stats.monitor_penalty < 0.7
+        ]
+        candidate = healthy if healthy else agents
+
+        return max(candidate, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """执行 Agent，失败时降级到 GeneralAgent。"""
+        """执行 Agent，失败时降级到 ExplainAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
-            agent = self._best_agent(AgentType.GENERAL)
+            agent = self._best_agent(AgentType.EXPLAIN)
         if agent is None:
             return AgentResponse(
-                agent_type=AgentType.GENERAL,
-                content="服务暂时不可用，请稍后重试。",
+                agent_type=AgentType.EXPLAIN,
+                content="学习服务暂时不可用，请稍后重试",
                 success=False,
             )
 
         response = await agent.handle(req)
 
-        # 专属 Agent 失败时降级到 GeneralAgent
-        if not response.success and agent_type != AgentType.GENERAL:
-            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
-            fallback = self._best_agent(AgentType.GENERAL)
+        # 专属 Agent 失败时降级到 ExplainAgent
+        if not response.success and agent_type != AgentType.EXPLAIN:
+            logger.warning(f"{agent_type.value} 失败，降级到 ExplainAgent")
+            fallback = self._best_agent(AgentType.EXPLAIN)
             if fallback:
                 response = await fallback.handle(req)
 

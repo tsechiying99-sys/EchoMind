@@ -81,6 +81,7 @@ class SkillManager:
         self._skills: List[Skill] = []
         self._errors: List[str] = []
 
+    #skills和errors进行浅拷贝
     @property
     def skills(self) -> List[Skill]:
         return list(self._skills)
@@ -100,6 +101,7 @@ class SkillManager:
             self._errors = []
             return []
 
+        #_discover_files返回一个Path对象
         for path in self._discover_files(self.root_dir):
             try:
                 skill = self._load_file(path)
@@ -213,6 +215,7 @@ class SkillManager:
 
     def _discover_files(self, root_dir: Path) -> Iterable[Path]:
         """发现可加载文件，优先读取目录规范文件 SKILL.md。"""
+        #递归查找root_dir目录下所有的SKILL.md文件，最后排序。结果都是Path对象。
         skill_md_files = sorted(root_dir.rglob("SKILL.md"))
         yielded = {path.resolve() for path in skill_md_files}
         for path in skill_md_files:

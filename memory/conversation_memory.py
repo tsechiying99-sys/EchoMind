@@ -24,7 +24,7 @@ import chromadb
 import redis
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content,extract_json_value
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class MemoryContext:
         if self.relevant_history:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
-            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=False)}")
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages:
@@ -156,7 +156,7 @@ class MemoryManager:
         if self._redis.llen(key) >= self.COMPRESS_AT:
             await self._compress(user_id, conv_id)
 
-    async def update_profile(self, user_id: str, conv_id: str) -> None:
+    async def update_profile(self, user_id: str, conv_id: str) -> bool:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。
         用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
@@ -165,43 +165,57 @@ class MemoryManager:
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
         if not messages:
-            return
+            return False
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。
-对话:
-{text}
-
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+        prompt = f"""你是学习状态分析器。
+                根据最近对话，提取学生当前的学习状态。
+                
+                要求:
+                1. 只能根据对话中明确出现的信息判断。
+                2. 不要因为学生问过某个知识点，就认为学生已经掌握。
+                3. 如果没有证据，对应字段返回空列表。
+                4. 所有字段必须是字符串列表。
+                
+                最近学习对话:
+                {text}
+                
+                只返回 JSON:
+                {{
+                  "learning_progress": [],
+                  "weak_points": [],
+                  "recent_mistakes": [],
+                  "preferred_style": []
+                }}"""
         prompt = self._safe_text(prompt)
 
         try:
             resp = await self._client.messages.create(
-                model=self._model, max_tokens=512, temperature=0.0,
+                model=self._model, max_tokens=2048, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
+            profile_data = extract_json_value(raw,dict)
 
-            doc_id = f"{user_id}_profile_{conv_id}"
+            doc_id = f"{user_id}_profile"
             doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
 
-            try:
-                self._profile.delete(ids=[doc_id])
-            except Exception:
-                pass
-
-            # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
-            self._profile.add(
+            # 更新 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
+            self._profile.upsert(
                 ids=[doc_id],
                 documents=[doc_text],
                 metadatas=[{"user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat()}],
             )
             logger.info(f"用户画像已更新: {user_id}")
+            return True
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
+            return False
+
+    async def get_profile(self, user_id: str) -> Dict[str,Any]:
+        return await self._get_profile(user_id)
+
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -248,7 +262,7 @@ class MemoryManager:
         if len(messages) < self.COMPRESS_AT:
             return
 
-        to_compress = messages[:-5]   # 保留最近 5 条
+        to_compress = messages[:-5]
         keep        = messages[-5:]
 
         # LLM 摘要
@@ -286,6 +300,7 @@ class MemoryManager:
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
     async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
+        """通过user_id与conv_id读取工作记忆"""
         key  = self._wm_key(user_id, conv_id)
         raws = self._redis.lrange(key, 0, self.WORKING_MAX - 1)
         msgs = []
@@ -338,15 +353,20 @@ class MemoryManager:
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
         try:
-            results = self._profile.get(where={"user_id": user_id}, limit=1)
-            if results["documents"]:
+            doc_id = f"{self._safe_text(user_id)}_profile"
+            results = self._profile.get(
+                ids=[doc_id],
+                include=["documents"],
+            )
+            if results.get("documents"):
                 return json.loads(results["documents"][0])
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.warning("读取用户画像失败: %s", ex)
         return {}
 
     @staticmethod
     def _wm_key(user_id: str, conv_id: str) -> str:
+        """生成工作记忆的key"""
         return f"wm:{user_id}:{conv_id}"
 
     @staticmethod

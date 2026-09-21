@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+import os
 import statistics
 import time
 from collections import defaultdict, deque
@@ -79,7 +80,9 @@ class AnomalyDetector:
         if len(buf) < self._window // 2:
             return None  # 数据不足，不检测
 
+        #计算均值
         mean  = statistics.mean(buf)
+        #计算标准差
         stdev = statistics.stdev(buf) if len(buf) > 1 else 0.0
         if stdev == 0:
             return None
@@ -143,6 +146,7 @@ class PerformanceMonitor:
             self._setup_prometheus(prometheus_port)
 
     def _setup_prometheus(self, port: int) -> None:
+        """设置prometheus指标"""
         self._prom = {
             "agent_success_rate": Gauge("agent_success_rate", "Agent 成功率", ["agent"]),
             "agent_latency_ms":   Histogram("agent_latency_ms", "Agent 延迟", ["agent"]),
@@ -155,6 +159,7 @@ class PerformanceMonitor:
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        """启动"""
         if self._active:
             return
         self._active = True
@@ -162,6 +167,7 @@ class PerformanceMonitor:
         logger.info(f"Monitor 已启动，采集间隔 {self._interval}s")
 
     async def stop(self) -> None:
+        """停止"""
         self._active = False
         if self._task:
             self._task.cancel()
@@ -173,6 +179,7 @@ class PerformanceMonitor:
     # ── 采集循环 ──────────────────────────────────────────────────────────────
 
     async def _loop(self) -> None:
+        """只要启动就一直loop循环采集，单次采集失败不影响后续采集"""
         while self._active:
             try:
                 await self._collect()
@@ -211,7 +218,12 @@ class PerformanceMonitor:
                 self._prom["agent_success_rate"].labels(agent=agent_key).set(sr)
                 self._prom["agent_latency_ms"].labels(agent=agent_key).observe(ms)
 
-            routing_penalties[agent_key] = self._routing_penalty(sr, ms)
+            #积累5个以上的样本再去影响路由
+            mini_routing_samples = 5
+            if s["total"] < mini_routing_samples:
+                routing_penalties[agent_key] = 0.0
+            else:
+                routing_penalties[agent_key] = self._routing_penalty(sr, ms)
 
         # ── 工具指标 ──────────────────────────────────────────────────────────
         for tool_name, s in tool_stats.items():
@@ -235,6 +247,7 @@ class PerformanceMonitor:
                 ))
 
         # ── 路由优化建议 ──────────────────────────────────────────────────────
+        #从_orchestrator中获取update_routing_penalties方法
         updater = getattr(self._orchestrator, "update_routing_penalties", None)
         if updater:
             updater(routing_penalties)
